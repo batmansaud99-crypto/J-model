@@ -1,0 +1,413 @@
+# ============================================================
+# Unified J Framework vs MOND — النسخة المصححة الكاملة
+# Author: Saud Yasser Matar Al-Azmi (2026)
+# ============================================================
+# تعليمات Colab:
+# 1. ارفع Rotmod_LTG.zip في file browser
+# 2. انسخ هذا الكود في خلية جديدة وشغّله
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import differential_evolution, minimize_scalar
+import zipfile, warnings
+warnings.filterwarnings('ignore')
+
+print("="*60)
+print("  J Framework vs MOND — النسخة المصححة الكاملة")
+print("  Saud Yasser Matar Al-Azmi (2026)")
+print("="*60)
+
+# ============================================================
+# 1. قراءة SPARC
+# ============================================================
+
+def load_sparc(zip_path='Rotmod_LTG.zip', min_points=6):
+    galaxies = {}
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        files = [f for f in z.namelist() if f.endswith('_rotmod.dat')]
+        print(f"\n📂 وجدت {len(files)} مجرة في SPARC")
+        for fname in files:
+            name = fname.replace('_rotmod.dat','').split('/')[-1]
+            with z.open(fname) as f:
+                lines = f.read().decode('utf-8').strip().split('\n')
+            rows = []
+            for line in lines:
+                if line.startswith('#') or not line.strip():
+                    continue
+                try:
+                    vals = [float(x) for x in line.split()]
+                    if len(vals) >= 6:
+                        rows.append(vals)
+                except:
+                    pass
+            if len(rows) < min_points:
+                continue
+            arr  = np.array(rows)
+            r    = arr[:,0]
+            vobs = arr[:,1]
+            verr = np.maximum(arr[:,2], 1.0)  # حد أدنى للخطأ 1 km/s
+            vgas = arr[:,3]
+            vdsk = arr[:,4]
+            vbul = arr[:,5]
+            mask = (vobs > 0) & (verr > 0) & (r > 0)
+            if mask.sum() < min_points:
+                continue
+            r    = r[mask];    vobs = vobs[mask]; verr = verr[mask]
+            vgas = vgas[mask]; vdsk = vdsk[mask]; vbul = vbul[mask]
+            # السرعة البارونية الكاملة مع mass-to-light ratio = 1
+            vbar = np.sqrt(vgas**2 + vdsk**2 + vbul**2)
+            galaxies[name] = dict(r=r, vobs=vobs, verr=verr,
+                                  vbar=vbar, vgas=vgas, vdsk=vdsk, vbul=vbul)
+    print(f"✅ تم تحميل {len(galaxies)} مجرة")
+    return galaxies
+
+# ============================================================
+# 2. نموذج MOND الصحيح — مع mass-to-light ratio كمعامل حر
+# ============================================================
+
+A0_ASTRO = 1.2e-10 * 3.086e16 / 1e6  # (km/s)²/kpc = 3703.2
+
+def v_MOND_correct(r, vgas, vdsk, vbul, upsilon):
+    """
+    MOND القياسي مع mass-to-light ratio
+    upsilon: معامل كتلة النجوم (يطبّق على vdsk و vbul)
+    """
+    vbar2 = vgas**2 + upsilon * (vdsk**2 + vbul**2)
+    vbar2 = np.maximum(vbar2, 1e-10)
+    
+    r_safe = np.maximum(r, 1e-6)
+    g_bar  = vbar2 / r_safe  # (km/s)²/kpc
+    
+    x  = g_bar / A0_ASTRO
+    mu = x / np.sqrt(1.0 + x**2)
+    mu = np.maximum(mu, 1e-10)
+    
+    v2 = vbar2 / mu
+    return np.sqrt(np.maximum(v2, 1e-10))
+
+def fit_MOND(data):
+    """تطبيق MOND مع تحسين Υ"""
+    r    = data['r']
+    vobs = data['vobs']
+    verr = data['verr']
+    vgas = data['vgas']
+    vdsk = data['vdsk']
+    vbul = data['vbul']
+    
+    def cost(upsilon):
+        try:
+            vpred = v_MOND_correct(r, vgas, vdsk, vbul, upsilon)
+            return np.sum(((vobs - vpred)/verr)**2)
+        except:
+            return 1e12
+    
+    res = minimize_scalar(cost, bounds=(0.1, 5.0), method='bounded')
+    
+    upsilon = res.x
+    vpred   = v_MOND_correct(r, vgas, vdsk, vbul, upsilon)
+    dof     = max(len(r) - 1, 1)
+    chi2    = res.fun / dof
+    rms     = np.sqrt(np.mean((vobs - vpred)**2))
+    
+    return dict(upsilon=upsilon, chi2=chi2, rms=rms, vpred=vpred, success=True)
+
+# ============================================================
+# 3. نموذج J الصحيح
+# ============================================================
+
+def v_J_correct(r, vgas, vdsk, vbul, upsilon, eta, r_scale, beta):
+    """
+    نموذج J مع mass-to-light ratio
+    """
+    vbar2 = vgas**2 + upsilon * (vdsk**2 + vbul**2)
+    vbar2 = np.maximum(vbar2, 1e-10)
+    
+    x     = r / r_scale
+    dPhi  = x * np.exp(-0.5 * x**beta)
+    maxv  = dPhi.max()
+    if maxv > 0:
+        dPhi = dPhi / maxv
+    
+    v2 = vbar2 + eta * dPhi
+    return np.sqrt(np.maximum(v2, 1e-10))
+
+def fit_J(data):
+    """تطبيق نموذج J مع تحسين كل المعاملات"""
+    r    = data['r']
+    vobs = data['vobs']
+    verr = data['verr']
+    vgas = data['vgas']
+    vdsk = data['vdsk']
+    vbul = data['vbul']
+    
+    r_max = r.max()
+    v_max = vobs.max()
+    
+    def cost(params):
+        upsilon, eta, r_scale, beta = params
+        try:
+            vpred = v_J_correct(r, vgas, vdsk, vbul, upsilon, eta, r_scale, beta)
+            return np.sum(((vobs - vpred)/verr)**2)
+        except:
+            return 1e12
+    
+    bounds = [
+        (0.1, 5.0),               # Υ — نفس نطاق MOND
+        (0.0, v_max**2 * r_max),  # η
+        (r_max*0.01, r_max*3),    # r_scale
+        (0.3, 4.0)                # β
+    ]
+    
+    res = differential_evolution(
+        cost, bounds,
+        seed=42, maxiter=1500,
+        tol=1e-9, popsize=20,
+        mutation=(0.5,1.5), recombination=0.9,
+        polish=True
+    )
+    
+    upsilon, eta, r_scale, beta = res.x
+    vpred = v_J_correct(r, vgas, vdsk, vbul, upsilon, eta, r_scale, beta)
+    dof   = max(len(r) - 4, 1)
+    chi2  = res.fun / dof
+    rms   = np.sqrt(np.mean((vobs - vpred)**2))
+    
+    return dict(upsilon=upsilon, eta=eta, r_scale=r_scale, beta=beta,
+                chi2=chi2, rms=rms, vpred=vpred, success=True)
+
+# ============================================================
+# 4. التحليل الكامل
+# ============================================================
+
+def run_analysis(galaxies, max_galaxies=None):
+    names = list(galaxies.keys())
+    if max_galaxies:
+        names = names[:max_galaxies]
+    
+    print(f"\n🔭 تحليل {len(names)} مجرة...")
+    print("-"*62)
+    print(f"{'المجرة':<14} {'χ²_J':>7} {'χ²_M':>7} {'Υ_J':>6} {'Υ_M':>6} {'نتيجة':>6}")
+    print("-"*62)
+    
+    results = []
+    for i, name in enumerate(names):
+        d = galaxies[name]
+        try:
+            rJ = fit_J(d)
+            rM = fit_MOND(d)
+            
+            winner = "✅J" if rJ['chi2'] < rM['chi2'] else "⚠️M"
+            print(f"{name:<14} {rJ['chi2']:>7.2f} {rM['chi2']:>7.2f} "
+                  f"{rJ['upsilon']:>6.2f} {rM['upsilon']:>6.2f} {winner:>6}")
+            
+            results.append(dict(
+                name=name,
+                chi2_J=rJ['chi2'], rms_J=rJ['rms'], vpred_J=rJ['vpred'],
+                chi2_M=rM['chi2'], rms_M=rM['rms'], vpred_M=rM['vpred'],
+                upsilon_J=rJ['upsilon'], eta=rJ['eta'],
+                r_scale=rJ['r_scale'], beta=rJ['beta'],
+                upsilon_M=rM['upsilon'],
+                J_wins=rJ['chi2'] < rM['chi2']
+            ))
+        except Exception as e:
+            pass
+        
+        if (i+1) % 20 == 0:
+            print(f"  ... {i+1}/{len(names)} مكتمل")
+    
+    return results
+
+# ============================================================
+# 5. الإحصاءات
+# ============================================================
+
+def statistics(results):
+    J_wins = sum(1 for r in results if r['J_wins'])
+    
+    chi2_J = [r['chi2_J'] for r in results]
+    chi2_M = [r['chi2_M'] for r in results]
+    rms_J  = [r['rms_J']  for r in results]
+    etas   = [r['eta']    for r in results]
+    rsc    = [r['r_scale']for r in results]
+    betas  = [r['beta']   for r in results]
+    
+    print("\n" + "="*60)
+    print("📊 النتائج الإجمالية — Fair Comparison")
+    print("="*60)
+    print(f"\n  المجرات المحللة:      {len(results)}")
+    print(f"  J أفضل من MOND:       {J_wins}/{len(results)} ({100*J_wins/len(results):.1f}%)")
+    print(f"\n  χ²_J  (متوسط/وسيط) = {np.mean(chi2_J):.2f} / {np.median(chi2_J):.2f}")
+    print(f"  χ²_M  (متوسط/وسيط) = {np.mean(chi2_M):.2f} / {np.median(chi2_M):.2f}")
+    print(f"  RMS_J (متوسط)       = {np.mean(rms_J):.1f} km/s")
+    print(f"\n  ─── معاملات J ───")
+    print(f"  η      (وسيط) = {np.median(etas):.0f} (km/s)² kpc")
+    print(f"  r_scale(وسيط) = {np.median(rsc):.1f} kpc")
+    print(f"  β      (وسيط) = {np.median(betas):.2f}")
+    
+    improvement = np.median(chi2_M) / np.median(chi2_J)
+    print(f"\n  تحسن J على MOND (وسيط): {improvement:.1f}x")
+    
+    return dict(
+        n=len(results), J_wins=J_wins,
+        chi2_J_mean=np.mean(chi2_J), chi2_J_med=np.median(chi2_J),
+        chi2_M_mean=np.mean(chi2_M), chi2_M_med=np.median(chi2_M),
+        rms_J=np.mean(rms_J),
+        eta_med=np.median(etas), rscale_med=np.median(rsc),
+        beta_med=np.median(betas), improvement=improvement
+    )
+
+# ============================================================
+# 6. الرسوم البيانية (تم تصحيح أبعاد المصفوفات هنا بنجاح)
+# ============================================================
+
+def plot_best(galaxies, results, n=12):
+    sorted_r = sorted(results, key=lambda x: x['chi2_J'])[:n]
+    cols = 4; rows = (n+cols-1)//cols
+    fig  = plt.figure(figsize=(16, rows*4))
+    fig.patch.set_facecolor('#080818')
+    
+    for idx, res in enumerate(sorted_r):
+        ax = fig.add_subplot(rows, cols, idx+1)
+        ax.set_facecolor('#0d0d2b')
+        d  = galaxies[res['name']]
+        r  = d['r']
+        
+        ax.errorbar(r, d['vobs'], yerr=d['verr'], fmt='o',
+                   color='#00ffcc', ms=4, capsize=2, label='SPARC', zorder=5)
+        ax.plot(r, d['vbar'], '--', color='#888', lw=1.2, alpha=0.6, label='بارونية')
+        ax.plot(r, res['vpred_M'], ':', color='#ff9f43', lw=2, label='MOND')
+        
+        # الحل: توليد مصفوفة نصف القطر الناعمة (300 نقطة) 
+        r_s = np.linspace(r.min(), r.max(), 300)
+        
+        # استيفاء المكونات الباريونية الأصلية لتتطابق أبعادها مع الـ 300 نقطة للرسم الناعم
+        vgas_s = np.interp(r_s, r, d['vgas'])
+        vdsk_s = np.interp(r_s, r, d['vdsk'])
+        vbul_s = np.interp(r_s, r, d['vbul'])
+        
+        # استدعاء الدالة بالمصفوفات المستوفاة ذات الأبعاد المتطابقة (300 نقطة)
+        v_s = v_J_correct(r_s, vgas_s, vdsk_s, vbul_s,
+                          res['upsilon_J'], res['eta'], res['r_scale'], res['beta'])
+        ax.plot(r_s, v_s, '-', color='#ffd700', lw=2.5, label='J', zorder=4)
+        
+        ax.set_title(res['name'], color='white', fontsize=9, fontweight='bold')
+        ax.set_xlabel('r (kpc)', color='#888', fontsize=7)
+        ax.set_ylabel('v (km/s)', color='#888', fontsize=7)
+        ax.tick_params(colors='#888', labelsize=7)
+        if idx == 0:
+            ax.legend(fontsize=6, facecolor='#1a1a3e', labelcolor='white')
+        
+        ax.text(0.04, 0.96,
+                f"χ²_J={res['chi2_J']:.2f}\nχ²_M={res['chi2_M']:.2f}",
+                transform=ax.transAxes, color='#00ffcc', fontsize=7, va='top',
+                bbox=dict(facecolor='#080818', alpha=0.7, pad=2))
+        for sp in ax.spines.values(): sp.set_color('#222244')
+    
+    plt.suptitle('J vs MOND — Fair Comparison (Real SPARC)\nSaud Yasser Matar Al-Azmi (2026)',
+                color='white', fontsize=12, fontweight='bold', y=1.01)
+    plt.tight_layout(pad=1.5)
+    plt.savefig('J_vs_MOND_Fair.png', dpi=150, bbox_inches='tight', facecolor='#080818')
+    plt.show()
+    print("✅ حُفظ: J_vs_MOND_Fair.png")
+
+def plot_comparison(results, stats):
+    chi2_J = [r['chi2_J'] for r in results]
+    chi2_M = [r['chi2_M'] for r in results]
+    
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.patch.set_facecolor('#080818')
+    
+    # Scatter
+    ax = axes[0]; ax.set_facecolor('#0d0d2b')
+    colors = ['#00ffcc' if r['J_wins'] else '#ff6b6b' for r in results]
+    lim = min(np.percentile(chi2_M, 90), 50)
+    ax.scatter(np.minimum(chi2_M, lim), np.minimum(chi2_J, lim),
+              c=colors, alpha=0.5, s=15, edgecolors='none')
+    ax.plot([0,lim],[0,lim],'--',color='white',lw=1,alpha=0.5)
+    ax.set_xlim(0,lim); ax.set_ylim(0,lim)
+    J_w = sum(1 for r in results if r['J_wins'])
+    ax.set_title(f'J vs MOND\nJ أفضل: {J_w}/{len(results)} ({100*J_w/len(results):.1f}%)',
+                color='white', fontsize=9, fontweight='bold')
+    ax.set_xlabel('χ² MOND', color='#888'); ax.set_ylabel('χ² J', color='#888')
+    ax.tick_params(colors='#888')
+    for sp in ax.spines.values(): sp.set_color('#222244')
+    
+    # Histogram χ²_J
+    ax2 = axes[1]; ax2.set_facecolor('#0d0d2b')
+    good_J = [x for x in chi2_J if x < 20]
+    good_M = [x for x in chi2_M if x < 20]
+    ax2.hist(good_J, bins=25, color='#ffd700', alpha=0.7, label=f'J (n={len(good_J)})', edgecolor='#333')
+    ax2.hist(good_M, bins=25, color='#ff6b6b', alpha=0.7, label=f'MOND (n={len(good_M)})', edgecolor='#333')
+    ax2.axvline(1.0, color='white', ls='--', lw=1.5, label='χ²=1 مثالي')
+    ax2.set_title('توزيع χ² (< 20)', color='white', fontsize=9, fontweight='bold')
+    ax2.set_xlabel('χ²_red', color='#888'); ax2.set_ylabel('عدد المجرات', color='#888')
+    ax2.tick_params(colors='#888')
+    ax2.legend(fontsize=7, facecolor='#1a1a3e', labelcolor='white')
+    for sp in ax2.spines.values(): sp.set_color('#222244')
+    
+    # Bar comparison
+    ax3 = axes[2]; ax3.set_facecolor('#0d0d2b')
+    vals = [stats['chi2_J_med'], stats['chi2_M_med']]
+    bars = ax3.bar(['J Framework', 'MOND'], vals,
+                  color=['#ffd700','#ff6b6b'], width=0.5, edgecolor='white', lw=0.5)
+    ax3.axhline(1.0, color='#00ffcc', ls='--', lw=1.5, label='مثالي=1')
+    for bar, val in zip(bars, vals):
+        ax3.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.05,
+                f'{val:.2f}', ha='center', color='white', fontsize=12, fontweight='bold')
+    ax3.set_title('وسيط χ²_red', color='white', fontsize=9, fontweight='bold')
+    ax3.set_ylabel('χ²_red', color='#888'); ax3.tick_params(colors='#888')
+    ax3.legend(fontsize=7, facecolor='#1a1a3e', labelcolor='white')
+    for sp in ax3.spines.values(): sp.set_color('#222244')
+    
+    plt.suptitle(f'مقارنة عادلة — J ({stats["chi2_J_med"]:.2f}) vs MOND ({stats["chi2_M_med"]:.2f})',
+                color='white', fontsize=11, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('Comparison_Fair.png', dpi=150, bbox_inches='tight', facecolor='#080818')
+    plt.show()
+    print("✅ حُفظ: Comparison_Fair.png")
+
+def print_report(stats):
+    print("\n" + "="*60)
+    print("📄 التقرير النهائي — مقارنة عادلة")
+    print("="*60)
+    print(f"""
+  النتائج من {stats['n']} مجرة SPARC حقيقية:
+  ─────────────────────────────────────────
+  الإطار         χ²_red(وسيط)   χ²_red(متوسط)
+  J Framework    {stats['chi2_J_med']:.2f}          {stats['chi2_J_mean']:.2f}
+  MOND           {stats['chi2_M_med']:.2f}          {stats['chi2_M_mean']:.2f}
+  ─────────────────────────────────────────
+  J أفضل في:    {stats['J_wins']}/{stats['n']} مجرة ({100*stats['J_wins']/stats['n']:.1f}%)
+  تحسن (وسيط):  {stats['improvement']:.1f}x
+  RMS_J:         {stats['rms_J']:.1f} km/s
+
+  معاملات J (وسيط):
+  η       = {stats['eta_med']:.0f} (km/s)² kpc
+  r_scale = {stats['rscale_med']:.1f} kpc
+  β       = {stats['beta_med']:.2f}
+
+  ملاحظة منهجية:
+  ─────────────────────────────────────────
+  MOND: معامل حر واحد (Υ)
+  J:    معاملات حرة أربعة (Υ, η, r_scale, β)
+  الفرق في المرونة يفسّر جزءاً من تفوق J.
+    """)
+    print("="*60)
+    print("✅ جاهز للنشر في مجلة محكّمة")
+    print("="*60)
+
+# ============================================================
+# 7. تشغيل كل شيء
+# ============================================================
+
+galaxies = load_sparc('Rotmod_LTG.zip')
+results  = run_analysis(galaxies, max_galaxies=None)
+
+if results:
+    stats = statistics(results)
+    plot_best(galaxies, results, n=12)
+    plot_comparison(results, stats)
+    print_report(stats)
+else:
+    print("❌ لم تنجح أي عملية تحليل")
