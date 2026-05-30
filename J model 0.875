@@ -1,0 +1,479 @@
+# ============================================================
+# FULL SCIENTIFIC VERSION — J Framework vs MOND
+# Final Corrected Pipeline
+# ============================================================
+# Author: Saud Yasser Matar Al-Azmi (2026)
+#
+# Corrections in this version:
+# - Fixed informational_profile normalization (physical eta)
+# - Fixed test-set DOF for small galaxies
+# - Added minimum test-set size guard
+# - Removed unused vbar computation
+# - Stable seed everywhere
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import differential_evolution, minimize_scalar
+from scipy.stats import pearsonr
+import zipfile
+import warnings
+
+warnings.filterwarnings('ignore')
+
+print("=" * 70)
+print("  FULL SCIENTIFIC VALIDATION — J Framework vs MOND")
+print("=" * 70)
+
+
+# ============================================================
+# 1. LOAD SPARC
+# ============================================================
+
+def load_sparc(zip_path='Rotmod_LTG.zip', min_points=6):
+
+    galaxies = {}
+
+    with zipfile.ZipFile(zip_path, 'r') as z:
+
+        files = [f for f in z.namelist() if f.endswith('_rotmod.dat')]
+
+        print(f"\nFound {len(files)} galaxies in archive")
+
+        for fname in files:
+
+            name = fname.replace('_rotmod.dat', '').split('/')[-1]
+
+            with z.open(fname) as f:
+                lines = f.read().decode('utf-8').strip().split('\n')
+
+            rows = []
+
+            for line in lines:
+                if line.startswith('#') or not line.strip():
+                    continue
+                try:
+                    vals = [float(x) for x in line.split()]
+                    if len(vals) >= 6:
+                        rows.append(vals)
+                except:
+                    pass
+
+            if len(rows) < min_points:
+                continue
+
+            arr = np.array(rows)
+
+            r    = arr[:, 0]
+            vobs = arr[:, 1]
+            verr = np.maximum(arr[:, 2], 2.0)
+            vgas = arr[:, 3]
+            vdsk = arr[:, 4]
+            vbul = arr[:, 5]
+
+            mask = (
+                np.isfinite(r)    &
+                np.isfinite(vobs) &
+                np.isfinite(verr) &
+                (r > 0) & (vobs > 0)
+            )
+
+            if mask.sum() < min_points:
+                continue
+
+            galaxies[name] = {
+                'r':    r[mask],
+                'vobs': vobs[mask],
+                'verr': verr[mask],
+                'vgas': vgas[mask],
+                'vdsk': vdsk[mask],
+                'vbul': vbul[mask],
+            }
+
+    print(f"Loaded {len(galaxies)} galaxies (min {min_points} points each)")
+    return galaxies
+
+
+# ============================================================
+# 2. MOND MODEL
+# ============================================================
+
+A0_ASTRO = 3703.2   # (km/s)² / kpc  — standard MOND acceleration
+
+def v_MOND(r, vgas, vdsk, vbul, upsilon):
+
+    vbar2 = vgas**2 + upsilon * (vdsk**2 + vbul**2)
+    vbar2 = np.maximum(vbar2, 1e-8)
+
+    gN = vbar2 / np.maximum(r, 1e-6)
+
+    g = 0.5 * (gN + np.sqrt(gN**2 + 4.0 * gN * A0_ASTRO))
+
+    return np.sqrt(np.maximum(g * r, 1e-8))
+
+
+# ============================================================
+# 3. J FRAMEWORK
+# ============================================================
+
+def informational_profile(r, eta, r_scale, beta):
+    """
+    Physical informational term.
+    eta has units of (km/s)² — directly adds to v²_bar.
+    No max-normalization to preserve physical meaning.
+    """
+    x = r / np.maximum(r_scale, 1e-6)
+
+    # Bounded to avoid overflow for large x or beta
+    exponent = np.minimum(0.5 * x**beta, 500.0)
+
+    profile = x * np.exp(-exponent)
+
+    return eta * profile
+
+
+def v_J(r, vgas, vdsk, vbul, upsilon, eta, r_scale, beta):
+
+    vbar2  = vgas**2 + upsilon * (vdsk**2 + vbul**2)
+    Jterm  = informational_profile(r, eta, r_scale, beta)
+    v2     = np.maximum(vbar2 + Jterm, 1e-8)
+
+    return np.sqrt(v2)
+
+
+# ============================================================
+# 4. INFORMATION CRITERIA
+# ============================================================
+
+def compute_AIC(chi2, k):
+    return chi2 + 2 * k
+
+def compute_BIC(chi2, k, n):
+    return chi2 + k * np.log(max(n, 1))
+
+
+# ============================================================
+# 5. TRAIN / TEST SPLIT  (radial split — stronger generalization test)
+# ============================================================
+# Train on inner 70% of radii, test on outer 30%.
+# This tests whether J can predict unseen outer parts of the rotation
+# curve — a much stricter test than random shuffling.
+
+MIN_TEST_POINTS = 3   # guard against tiny test sets
+
+def split_data(data, frac=0.7):
+
+    # Sort by radius ascending
+    order     = np.argsort(data['r'])
+    n         = len(order)
+    train_n   = int(frac * n)
+
+    train_idx = order[:train_n]   # inner radii → train
+    test_idx  = order[train_n:]   # outer radii → test
+
+    train = {k: v[train_idx] for k, v in data.items()}
+    test  = {k: v[test_idx]  for k, v in data.items()}
+
+    return train, test
+
+
+# ============================================================
+# 6. FIT MOND
+# ============================================================
+
+def fit_MOND(data):
+
+    r, vobs, verr = data['r'], data['vobs'], data['verr']
+    vgas, vdsk, vbul = data['vgas'], data['vdsk'], data['vbul']
+
+    def chi2_fn(upsilon):
+        vpred = v_MOND(r, vgas, vdsk, vbul, upsilon)
+        return np.sum(((vobs - vpred) / verr) ** 2)
+
+    res = minimize_scalar(chi2_fn, bounds=(0.1, 5.0), method='bounded')
+
+    upsilon    = res.x
+    chi2_total = res.fun
+    n          = len(r)
+    dof        = max(n - 1, 1)
+
+    return {
+        'upsilon':  upsilon,
+        'chi2':     chi2_total,
+        'chi2_red': chi2_total / dof,
+        'AIC':      compute_AIC(chi2_total, 1),
+        'BIC':      compute_BIC(chi2_total, 1, n),
+        'vpred':    v_MOND(r, vgas, vdsk, vbul, upsilon),
+    }
+
+
+# ============================================================
+# 7. FIT J FRAMEWORK
+# ============================================================
+
+def fit_J(data):
+
+    r, vobs, verr = data['r'], data['vobs'], data['verr']
+    vgas, vdsk, vbul = data['vgas'], data['vdsk'], data['vbul']
+
+    r_max = r.max()
+    v_max = vobs.max()
+
+    def chi2_fn(params):
+        upsilon, eta, r_scale, beta = params
+        vpred = v_J(r, vgas, vdsk, vbul, upsilon, eta, r_scale, beta)
+        return np.sum(((vobs - vpred) / verr) ** 2)
+
+    bounds = [
+        (0.1,  5.0),                   # upsilon
+        (0.0,  v_max**2 * 10.0),       # eta  (km/s)²  — tighter upper bound
+        (0.3,  r_max * 2.0),           # r_scale  kpc
+        (0.5,  4.0),                   # beta
+    ]
+
+    res = differential_evolution(
+        chi2_fn,
+        bounds,
+        seed=42,
+        maxiter=600,
+        popsize=15,
+        polish=True,
+        tol=1e-8,
+        workers=1,
+    )
+
+    upsilon, eta, r_scale, beta = res.x
+    chi2_total = res.fun
+    n   = len(r)
+    dof = max(n - 4, 1)
+
+    return {
+        'upsilon':  upsilon,
+        'eta':      eta,
+        'r_scale':  r_scale,
+        'beta':     beta,
+        'chi2':     chi2_total,
+        'chi2_red': chi2_total / dof,
+        'AIC':      compute_AIC(chi2_total, 4),
+        'BIC':      compute_BIC(chi2_total, 4, n),
+        'vpred':    v_J(r, vgas, vdsk, vbul, upsilon, eta, r_scale, beta),
+    }
+
+
+# ============================================================
+# 8. GENERALIZATION TEST
+# ============================================================
+
+def evaluate_generalization(data):
+
+    train, test = split_data(data)
+
+    # Guard: skip if test set too small
+    if len(test['r']) < MIN_TEST_POINTS:
+        return None
+
+    Jfit = fit_J(train)
+    Mfit = fit_MOND(train)
+
+    pred_J = v_J(
+        test['r'], test['vgas'], test['vdsk'], test['vbul'],
+        Jfit['upsilon'], Jfit['eta'], Jfit['r_scale'], Jfit['beta']
+    )
+
+    pred_M = v_MOND(
+        test['r'], test['vgas'], test['vdsk'], test['vbul'],
+        Mfit['upsilon']
+    )
+
+    n_test = len(test['r'])
+
+    chi2_J = np.sum(((test['vobs'] - pred_J) / test['verr']) ** 2) / max(n_test, 1)
+    chi2_M = np.sum(((test['vobs'] - pred_M) / test['verr']) ** 2) / max(n_test, 1)
+
+    return {'J_test': chi2_J, 'M_test': chi2_M}
+
+
+# ============================================================
+# 9. FULL ANALYSIS
+# ============================================================
+
+def analyze(galaxies, limit=None):
+
+    names = list(galaxies.keys())
+    if limit:
+        names = names[:limit]
+
+    results  = []
+    skipped  = 0
+
+    print(f"\nRunning scientific validation on {len(names)} galaxies...\n")
+
+    for i, name in enumerate(names):
+
+        d = galaxies[name]
+
+        try:
+            Jfit = fit_J(d)
+            Mfit = fit_MOND(d)
+            gen  = evaluate_generalization(d)
+
+            if gen is None:
+                skipped += 1
+                continue
+
+            results.append({
+                'name':       name,
+                'J_chi2_red': Jfit['chi2_red'],
+                'M_chi2_red': Mfit['chi2_red'],
+                'J_AIC':      Jfit['AIC'],
+                'M_AIC':      Mfit['AIC'],
+                'J_BIC':      Jfit['BIC'],
+                'M_BIC':      Mfit['BIC'],
+                'J_test':     gen['J_test'],
+                'M_test':     gen['M_test'],
+                'eta':        Jfit['eta'],
+                'r_scale':    Jfit['r_scale'],
+                'beta':       Jfit['beta'],
+                'J_wins':     Jfit['chi2_red'] < Mfit['chi2_red'],
+            })
+
+        except Exception as e:
+            print(f"  Failed: {name} — {e}")
+
+        if (i + 1) % 10 == 0:
+            print(f"  Completed {i+1}/{len(names)}")
+
+    if skipped:
+        print(f"\n  Skipped {skipped} galaxies (test set < {MIN_TEST_POINTS} points)")
+
+    return results
+
+
+# ============================================================
+# 10. SUMMARY
+# ============================================================
+
+def summary(results):
+
+    n      = len(results)
+    Jwins  = sum(r['J_wins'] for r in results)
+
+    chiJ   = [r['J_chi2_red'] for r in results]
+    chiM   = [r['M_chi2_red'] for r in results]
+    AIC_J  = [r['J_AIC']     for r in results]
+    AIC_M  = [r['M_AIC']     for r in results]
+    BIC_J  = [r['J_BIC']     for r in results]
+    BIC_M  = [r['M_BIC']     for r in results]
+    testJ  = [r['J_test']    for r in results]
+    testM  = [r['M_test']    for r in results]
+
+    print("\n" + "=" * 70)
+    print("  FINAL SCIENTIFIC SUMMARY")
+    print("=" * 70)
+    print(f"  Galaxies analyzed : {n}")
+    print(f"  J wins            : {Jwins}/{n}  ({100*Jwins/n:.1f}%)")
+
+    print("\n  Reduced Chi²:")
+    print(f"    J Framework  median = {np.median(chiJ):.3f}")
+    print(f"    MOND         median = {np.median(chiM):.3f}")
+
+    print("\n  AIC:")
+    print(f"    J Framework  median = {np.median(AIC_J):.2f}")
+    print(f"    MOND         median = {np.median(AIC_M):.2f}")
+
+    print("\n  BIC:")
+    print(f"    J Framework  median = {np.median(BIC_J):.2f}")
+    print(f"    MOND         median = {np.median(BIC_M):.2f}")
+
+    print("\n  Generalization (Test Set):")
+    print(f"    J Framework  median = {np.median(testJ):.3f}")
+    print(f"    MOND         median = {np.median(testM):.3f}")
+
+    print("\n  Median Parameters:")
+    print(f"    eta     = {np.median([r['eta']     for r in results]):.1f}  (km/s)²")
+    print(f"    r_scale = {np.median([r['r_scale'] for r in results]):.2f} kpc")
+    print(f"    beta    = {np.median([r['beta']    for r in results]):.2f}")
+
+    print("\n  Interpretation:")
+    if np.median(BIC_J) < np.median(BIC_M):
+        print("  → J Framework preferred by BIC (complexity penalty absorbed)")
+    else:
+        print("  → MOND preferred by BIC — J wins on chi² but complexity penalized")
+
+    if np.median(testJ) < np.median(testM):
+        print("  → J generalizes better to unseen data ✓")
+    else:
+        print("  → MOND generalizes better — possible overfitting in J")
+
+    print("=" * 70)
+
+
+# ============================================================
+# 11. PARAMETER CORRELATIONS
+# ============================================================
+
+def parameter_correlations(results):
+
+    eta = np.array([r['eta']     for r in results])
+    rs  = np.array([r['r_scale'] for r in results])
+    b   = np.array([r['beta']    for r in results])
+
+    print("\n  Parameter Correlations (Pearson r):")
+    print(f"    eta  ↔ r_scale : {pearsonr(eta, rs)[0]:.3f}")
+    print(f"    eta  ↔ beta    : {pearsonr(eta,  b)[0]:.3f}")
+    print(f"    r_scale ↔ beta : {pearsonr(rs,   b)[0]:.3f}")
+    print("  Note: |r| > 0.7 suggests parameter degeneracy")
+
+
+# ============================================================
+# 12. PARAMETER STABILITY
+# ============================================================
+
+def parameter_stability(results):
+
+    eta = np.array([r['eta']     for r in results])
+    rs  = np.array([r['r_scale'] for r in results])
+    b   = np.array([r['beta']    for r in results])
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+    axes[0].hist(np.log10(eta + 1), bins=20, color='steelblue', edgecolor='white')
+    axes[0].set_title('log₁₀(eta + 1)  [(km/s)²]')
+    axes[0].set_xlabel('value')
+
+    axes[1].hist(rs, bins=20, color='coral', edgecolor='white')
+    axes[1].set_title('r_scale  [kpc]')
+    axes[1].set_xlabel('value')
+
+    axes[2].hist(b, bins=20, color='seagreen', edgecolor='white')
+    axes[2].set_title('beta  [dimensionless]')
+    axes[2].set_xlabel('value')
+
+    plt.suptitle('J Framework — Parameter Distributions', fontsize=13)
+    plt.tight_layout()
+    plt.savefig('parameter_stability.png', dpi=150)
+    plt.show()
+
+    print("\n  Parameter Stability:")
+    print(f"    eta     — median: {np.median(eta):.1f},  std: {np.std(eta):.1f}")
+    print(f"    r_scale — median: {np.median(rs):.2f}, std: {np.std(rs):.2f}")
+    print(f"    beta    — median: {np.median(b):.2f},  std: {np.std(b):.2f}")
+
+
+# ============================================================
+# 13. MAIN
+# ============================================================
+
+if __name__ == '__main__':
+
+    galaxies = load_sparc('Rotmod_LTG.zip')
+
+    results = analyze(galaxies)
+
+    summary(results)
+
+    parameter_correlations(results)
+
+    parameter_stability(results)
+
+    print("\n  Scientific validation complete.")
